@@ -1,0 +1,753 @@
+---
+title: "CNV_Bench"
+author: "Madyson Colton"
+date: "22/04/2022"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# RNAseqCNV 
+
+Implementing the RNAseqCNV caller into the SAHMRI bioinformatics pipeline following variant calling. This tool can be used to determine aneuploidy in samples missing karyotype data.
+
+Before implementing into our pipeline, the accuracy of the caller was assessed.
+
+## Installing on the HPC
+
+R is required to run RNAseqCNV. An virtual environment was created to install the latest version of R and related packages.
+
+```{bash Renv, eval=F, echo=T}
+ mamba create --name Renv r-base r-essentials
+ mamba activate Renv
+ mamba install -c bioconda bioconductor-biocinstaller
+
+```
+
+To install RNAseqCNV and dependencies, run the installCNV.R script. The RNAseqCNV package is stored on GitHub, so the devtools package is required for installation. 
+
+```{bash install command, eval=F, echo=T}
+Rscript installCNV.R
+
+```
+
+
+```{r installCNV.R script, eval=F, echo=T}
+# Set default repo
+local({r <- getOption("repos")
+       r["CRAN"] <- "http://cran.r-project.org"
+       options(repos=r)
+})
+
+
+install.packages('devtools')
+
+library(devtools)
+
+devtools::install_github(repo = "honzee/RNAseqCNV")
+
+```
+
+
+Some dependent packages may have to be installed manually. For me, ggpubr was causing the installation to fail. If this happens, install the dependecies via mamba/conda.
+
+```{bash ggpubr, eval=F, echo=T}
+mamba install -c conda-forge r-ggpubr
+
+```
+
+## Locate and Tidy Data
+
+To determine CNVs, the tool requires both sequencing counts and SNV frequencies.
+
+The counts data should have only 2 columns - the ensembl IDs and the read counts - and no header.
+The SNV information can be provided as a .vcf (or vcf.gz) file following the GATK pipeline. This file should contain headers; RNAseqCNV will require the chromosome number, start position, read depth and mutant allele frequency.
+
+
+The RNAseqCNV wrapper then requires the following:
+
+* A config file
+  + Directory to store the output files
+  + Directory containing the counts files
+  + Directory containing the vcf files
+  
+* A metadata file, containing the following 3 columns with no headers:
+  + Sample ID
+  + Path to the sample's counts file
+  + Path to the sample's vcf file
+  
+
+### Config file
+
+An example of the config file is given below. The variable names must not be changed. The out_dir path should be the same as the outDir for the variant calling pipeline, and should end in a "/"; the count_dir and snv_dir paths should not have a "/" at the end. 
+
+```{bash config file, eval=F, echo=T}
+out_dir = "~/CNV/outDir/"
+count_dir = "~/CNV"
+snv_dir = "/cancer/storage/results"
+
+
+```
+
+
+### Counts data
+
+The counts data need to be converted from an ".rData" file to a ".csv" file with two columns. As all our previous samples have been stored in a ".RDS" object in the required format, we can extract the count data from the object by running extractCountsAll.R. As we want to run the RNAseqCNV tool on all our previous samples, the summary log of our files is required.
+
+```{r extractCountsAll.R script, eval=F, echo=T}
+# Default repo
+local({r <- getOption("repos")
+r["CRAN"] <- "http://cran.r-project.org"
+options(repos=r)
+})
+
+library(dplyr)
+
+# Load sample summary file
+sampleSumm <- read.csv("/data/bioinformatics/leukaemia_bank/meta_data/summary_ALL_samples.csv")
+
+# Load count data
+counts <- readRDS("/data/bioinformatics/leukaemia_bank/Rdata/countData.rds")
+
+# For all samples
+sampleNames <- sampleSumm$variant_file_ID
+
+# Directory to save the counts files
+countOut <- "~/CNV/counts/"
+
+
+# Create list for failed samples
+notRun <- list()
+
+# Extract counts for all sampleNames
+for(i in 1:length(sampleNames)){
+  
+  sampleID <- sampleNames[i]
+  
+  bankID <- sampleSumm[which(sampleSumm$variant_file_ID == sampleID),4]
+  
+  if(bankID %in% colnames(counts)){
+    sampleCounts <- counts %>% 
+      dplyr::select(c("gene_id", bankID))
+   
+     names(sampleCounts) <- NULL
+    
+    write.table(sampleCounts, 
+                paste0(countOut, bankID, "_counts.csv"), 
+                col.names = FALSE, 
+                sep=",", 
+                row.names = FALSE, 
+                quote = FALSE, 
+                eol = "\r")
+    
+  print(paste0(bankID, " done."))
+  
+    }else{
+    notRun[[sampleID]] <- append(bankID, "Not found")
+    print(paste0(bankID, " not found"))
+  }
+}
+
+# Save failed counts in a dataframe
+notRun <- notRun %>% 
+  as.data.frame() %>% 
+  t() 
+
+colnames(notRun) <- c("sampleID", "status")
+
+write.table(notRun, 
+            paste0(countOut, "notRun.csv"), 
+            row.names = FALSE, 
+            sep=",", 
+            quote = FALSE, 
+            eol = "\r")
+
+
+```
+
+All samples were found.
+
+
+### Metadata file
+
+#### 2020 Samples
+To run the RNAseqCNV caller on all of our samples, a custom metadata sheet was generated. Our more recent samples have SNV data stored as ".vcf.gz" zipped file, whereas older samples are simply ".vcf". The location of the sequencing counts for older samples are also stored in different locations with an esoteric file naming system, so initially only the 2020 samples were included. 
+
+```{r metaAll.R script, eval=F, echo=T}
+### Metadata table for benchmarking previous samples ###
+
+# Default repo
+local({r <- getOption("repos")
+r["CRAN"] <- "http://cran.r-project.org"
+options(repos=r)
+})
+
+library(stringr)
+library(dplyr)
+
+# To run on all samples, use the sample summary variant file IDs
+metaD <- read.csv("/data/bioinformatics/leukaemia_bank/meta_data/summary_ALL_samples.csv")
+
+# Only use the 2020 samples
+# Paste file locations
+metaD <- metaD %>% 
+  mutate(variant_loc = if_else(str_detect(variant_loc, "2020") == TRUE, 
+                                                paste0(variant_loc, "/Variants/", variant_file_ID, ".raw.vcf.gz"), 
+                                                paste0("")))
+
+metaD <- metaD[metaD$variant_loc != "",]
+
+# Add a row for counts data
+metaD <- metaD %>% 
+  mutate(counts_loc = paste0("counts/", LB_ID, "_counts.csv"))
+
+metaTable <- metaD %>% 
+  select(c("variant_file_ID", "counts_loc", "variant_loc"))
+
+
+# Save table in working directory
+write.table(metaTable, 
+            paste0("~/CNV/metadata.csv"), 
+            col.names = FALSE, 
+            sep=",", 
+            row.names = FALSE, 
+            quote = FALSE, 
+            eol = "\r")
+
+```
+
+
+To be able to find the /cancer/storage directories containing the vcf file, the RNAseqCNV tool will have to be initiated from the root directory. Therefore, snv_dir location in the config file is set as "/cancer/storage/results", so this has to be removed from the metadata variant location file names.
+
+```{bash rename var locations, eval=F, echo = T}
+# -i makes changes in place
+# s/ substitute command
+# /g global replacement, not just first instance
+# \ to escape the / characters in the string
+
+sed -i 's/\/cancer\/storage\/results\/ALL/ALL/g' metadata.csv
+
+```
+
+#### Older Samples
+
+Since the older samples were stored under unusual naming systems, files ending in ".raw.vcf" were located using the Sys.glob() function in R.
+
+```{r findOldFiles.R, eval=FALSE, warning=FALSE, message=FALSE}
+
+### Metadata table for benchmarking previous samples ###
+
+# Default repo
+local({r <- getOption("repos")
+r["CRAN"] <- "http://cran.r-project.org"
+options(repos=r)
+})
+
+### Load Libraries ###
+library(stringr)
+library(dplyr)
+
+# Load the sample summary sheet containing the parent directories
+oldMeta <- read.csv("/data/bioinformatics/leukaemia_bank/meta_data/summary_ALL_samples.csv")
+
+# Select only the older samples and then the columns of interest
+oldMeta <- oldMeta %>% 
+  filter(str_detect(variant_loc, "2020") == FALSE) %>% 
+  select(c("patientID", "variant_file_ID","LB_ID", "variant_loc"))
+
+# Add the "/Variants" directory onto the end of the old file path
+oldMeta <- oldMeta %>% 
+  mutate(variant_loc = paste0(variant_loc, "/Variants"))
+
+# Change the variant_loc column name for clarity
+# Create an empty new variant_loc column
+colnames(oldMeta) <- c("patientID", "variant_file_ID","LB_ID", "old_loc")
+
+oldMeta$variant_loc <- ""
+
+# For each sample, paste the name of the file ending in ".raw.vcf"
+# Set condition to handle missing/duplicate files 
+
+for(i in 1:nrow(oldMeta)){
+  path <- oldMeta[i,]$old_loc
+  variant_loc <- Sys.glob(file.path(path, '*.raw.vcf'))
+  if(length(variant_loc) != 1){
+    oldMeta[i,5] <- "NA"
+  }else{
+  oldMeta[i,5] <- paste(variant_loc)
+}
+}
+
+# Create a metaD table also containg the counts paths (from extractCounts.R)
+metaD <- oldMeta %>% 
+  mutate(counts_loc = paste0("counts/", LB_ID, "_counts.csv"))
+
+# Select columns in required order for RNAseqCNV
+
+metaTable <- metaD %>% 
+  select(c("variant_file_ID", "counts_loc", "variant_loc"))
+
+
+# Save table in working directory
+write.table(metaTable, 
+            paste0("~/CNV/old_metadata.csv"), 
+            col.names = FALSE, 
+            sep=",", 
+            row.names = FALSE, 
+            quote = FALSE, 
+            eol = "\r")
+print("saved")
+
+```
+
+The script contains a function to generate "NA" if there are missing or duplicate .vcf files in that directory. I initially forgot to remove these from the metadata column, so ran a script to remove all rows containing NAs. The variant file location names were also edited to remove "/cancer/storage/results" as with the 2020 samples above.
+
+```{r deleteNA.R, eval = FALSE, warning=FALSE, message=FALSE}
+# Default repo
+local({r <- getOption("repos")
+r["CRAN"] <- "http://cran.r-project.org"
+options(repos=r)
+})
+
+library(dplyr)
+
+# Load metadata table
+metaTable <- read.csv("~/CNV/old_metadata.csv")
+
+# Remove NAs
+metaTable <- metaTable[complete.cases(metaTable),]
+
+# Save table
+write.table(metaTable,
+            paste0("~/CNV/old_metadata.csv"),
+            col.names = FALSE,
+            sep=",",
+            row.names = FALSE,
+            quote = FALSE,
+            eol = "\r")
+print("saved")
+
+
+```
+
+
+
+## Running RNAseqCNV
+
+To run the tool, the path to the config and metadata files should be provided and specified within the RNAseqCNV_wrapper() function. The format of the variant file should also be specified ("vcf") and the genome version (typically "hg19" in our pipeline). As this analysis is only interested in the called chromosome number, arm level figures are not required. Choosing "FALSE" for this parameter will greatly reduce run time.
+
+
+```{r RNAseqCNV.R, eval=F, echo=T}
+## Default repo
+local({r <- getOption("repos")
+       r["CRAN"] <- "http://cran.r-project.org"
+       options(repos=r)
+})
+
+library(RNAseqCNV)
+
+configPath <- "~/CNV/config"
+metaPath <- paste0("~/CNV/metadata.csv")
+
+
+RNAseqCNV_wrapper(config = configPath,
+                  metadata = metaPath,
+                  snv_format = "vcf",
+                  genome_version = "hg19",
+                  arm_lvl = FALSE)
+
+```
+
+
+The resulting estimation table was copied back to my local computer for analysis.
+
+```{bash copy table, eval=F, echo=T}
+scp madyson.colton@edp-prd-lin-nfs01:~/CNV/outDir/estimation_table.tsv .
+```
+
+## Assessment of results
+
+To assess the accuracy of the RNAseqCNV caller, the results were compared to our known karyotype data and subtyping.
+
+Only good quality, diagnositic B-ALL samples were included in the benchmarking analysis. Patients who were unclassified and grouped with the "B-Other" subtype were also excluded as these are believed to have been unclassified due to missing karyotype data.
+
+As the RNAseqCNV caller was ran twice (on the 2020 samples and then on the older samples), the results had to be combined into a single .csv file. This file was used in further analysis.
+
+```{r merge results, warning=FALSE, message=FALSE}
+
+# Load both results tables
+cnvTable2020 <- read.table("estimation_table2020.tsv", sep = "\t", header = T)
+oldCNVTable <- read.table("estimation_table.tsv", sep = "\t", header = T)
+
+# Merge CNV data
+cnvTable <- rbind(cnvTable2020, oldCNVTable)
+
+# Save
+write.csv(cnvTable, "combined_table.csv")
+
+```
+
+
+
+```{r analyseCNV.R, echo=T, warning = FALSE, messages=FALSE}
+### Load Libraries ###
+
+library(dplyr)
+library(stringr)
+library(ggplot2)
+
+cbPalette <- c("#0072B2", "#E69F00", "#009E73", "#F0E442", "#56B4E9", "#D55E00", "#CC79A7")
+
+# Load table and sample anno
+
+cnvTable <- read.table("combined_table.csv", sep = ",", header = T)
+sampleAnno <- read.csv("~/Documents/LBank/meta_data/sample_annotation.csv")
+karyoData <- read.csv("~/Documents/LBank/meta_data/ALL_karyotype_data.csv")
+
+# Merge into singular DF
+allData <- left_join(cnvTable, sampleAnno, by = c("sample" = "variant_file_ID")) %>%
+  left_join(karyoData, by = "LB_ID")
+
+# Create column to extract karyotype info
+allData <- allData %>% 
+  mutate(karyo_n = str_sub(Karyotype, start=2, end=3))
+
+# Handle NAs in karyo_n
+allData$karyo_n <- as.numeric(allData$karyo_n) 
+allData$karyo_n[is.na(allData$karyo_n)] <- 0
+
+# Remove low quality samples
+# Remove "others" as some of these were unclassfied due to missing cytogenetics
+# Select only B-ALL and Diagnostic samples
+noCyto <- allData %>% filter(exclude != "Yes",
+                              !is.na(col),
+                              Diagnosis.x %in% c("B-ALL", "Ph+ALL"),
+                              sample.y == "Dx")
+
+
+```
+
+### Classification of patients:  
+
++ Normal = 46 chromsomes
++ Hyperdiploid > 46 chromosomes
++ Hypodiploid < 46 chromosomes
+
+In total, 124 of the 374 samples had recorded cytogenetics and were classified into three groups based on the number of chromosomes described above. For the samples without this information, the research groups' classification information was used: patients who were not classified as Hyperdiploid or Hypodiploid were considered to have "normal" ploidy. 
+
+```{r karyotype table, echo=FALSE, warning=FALSE}
+knitr::kable(noCyto %>% count(Cyto_provided), caption = "Number of samples with cytogenetics")
+```
+
+### Plot Accuracy
+
+Patients were classified into groups as described, and then a new column was created to reclassify samples based on the results of RNAseqCNV. The classifications were compared.
+
+```{r benchmarking plot, warning=FALSE}
+
+# Create column to classify cnv output
+# Create column for karyype classification
+noCyto <- noCyto %>% 
+  mutate(cnvCol = if_else(chrom_n == "46", "Normal", "")) %>% 
+  mutate(cnvCol = if_else(chrom_n > "46", "Hyperdiploid", cnvCol)) %>%
+  mutate(cnvCol = if_else(chrom_n < "46", "Hypodiploid", cnvCol)) %>%
+  mutate(oldCol = if_else(col %in% c("Hyperdiploid", "Hypodiploid"), col, "Normal")) %>%
+  mutate(oldCol = if_else(karyo_n == "46", "Normal", oldCol)) %>% 
+  mutate(oldCol = if_else(karyo_n > "46", "Hyperdiploid", oldCol)) %>%
+  mutate(oldCol = if_else(karyo_n %in% c(1:45), "Hypodiploid", oldCol))
+ 
+noCyto <- noCyto %>% 
+  mutate(correctBench = if_else(cnvCol == oldCol, "Correct", "Incorrect"))
+
+# Create dataframe for plotting
+noCytoPerc <- noCyto %>% 
+  count(oldCol, correctBench) %>% 
+  group_by(oldCol) %>% 
+  mutate(label_y = n/sum(n)) 
+
+
+noCytoPlot <- noCytoPerc %>% 
+  ggplot(aes(x=oldCol, y=label_y, fill=correctBench)) +
+  geom_col(position="stack") +
+  geom_text(aes(label=paste(paste0(round(label_y*100, digits=0), "%"), paste0("(", n, ")"))), 
+            position=position_stack(vjust = 0.5),
+            colour="white",
+            size=3,
+            fontface="bold") +
+  scale_fill_manual(values= cbPalette) +
+  theme_classic() +
+  labs(x = "Ploidy",
+       y = "Percentage of Samples",
+       fill = "RNAseqCNV Result") +
+  ggtitle("Benchmarking of RNAseqCNV Tool on All Samples")
+
+```
+  
+
+```{r, echo = FALSE}
+noCytoPlot
+```
+
+Overall, RNAseqCNV matched our classification in 83% of cases. 
+
+```{r overall table, warning=FALSE, echo = FALSE}
+knitr::kable(noCyto %>% count(correctBench) %>% mutate(Percentage = n/sum(n)*100), caption = "Accuracy of the RNAseqCNV Tool")
+```
+
+### Comparison with Karyotype Data
+  
+The results were similar when looking only at the patients with known karyotypes, with an overall accuracy of 84%. 
+
+
+```{r cyto plots, warning=FALSE}
+cytoData <- allData %>% filter(exclude != "Yes",
+                              !is.na(col),
+                              Diagnosis.x %in% c("B-ALL", "Ph+ALL"),
+                              sample.y == "Dx",
+                              karyo_n != 0)
+
+# Create column to classify cnv output
+# Create column for karyype classification
+cytoData <- cytoData %>% 
+  mutate(cnvCol = if_else(chrom_n == "46", "Normal", "")) %>% 
+  mutate(cnvCol = if_else(chrom_n > "46", "Hyperdiploid", cnvCol)) %>%
+  mutate(cnvCol = if_else(chrom_n < "46", "Hypodiploid", cnvCol)) %>%
+  mutate(oldCol = if_else(karyo_n == "46", "Normal", "")) %>% 
+  mutate(oldCol = if_else(karyo_n > "46", "Hyperdiploid", oldCol)) %>%
+  mutate(oldCol = if_else(karyo_n < "46", "Hypodiploid", oldCol))
+
+cytoData <- cytoData %>% 
+  select(c("patientID.x", "LB_ID", "gender", "ref", "key_alt", "primary.subtype", "Karyotype", "karyo_n", "chrom_n", "alterations", "cnvCol", "oldCol"))
+
+# Create column comparing classification
+cytoData <- cytoData %>% 
+  mutate(correctBench = if_else(cnvCol == oldCol, "Correct", "Incorrect"))
+
+# Create dataframe for plotting
+cytoPerc <- cytoData %>% 
+  count(oldCol, correctBench) %>% 
+  group_by(oldCol) %>% 
+  mutate(label_y = n/sum(n)) 
+
+cytoPlot <- cytoPerc %>% 
+  ggplot(aes(x=oldCol, y=label_y, fill=correctBench)) +
+  geom_col(position="stack") +
+  geom_text(aes(label=paste(paste0(round(label_y*100, digits=0), "%"), paste0("(", n, ")"))), 
+            position=position_stack(vjust = 0.5),
+            colour="white",
+            size=3,
+            fontface="bold") +
+  scale_fill_manual(values= cbPalette) +
+  theme_classic() +
+  labs(x = "Ploidy",
+       y = "Percentage of Samples",
+       fill = "RNAseqCNV Result") +
+  ggtitle("Benchmarking of RNAseqCNV Tool on Samples With Known Karyotypes")
+
+```
+  
+
+```{r cytoPercPlot, echo = FALSE}
+cytoPlot
+```
+
+  
+#### Accuracy of the RNAseqCNV Tool in Matching Known Karyotype
+
+```{r cyto overall table, echo = FALSE}
+knitr::kable(cytoData %>% count(correctBench) %>% mutate(Percentage = n/sum(n)*100))
+```
+
+  
+In total, 20 samples were incorrectly classified. Most of these (n=18) had 45-47 chromosomes, and the rest were masked hypodiploid (n=2). One of the incorrect samples had deletion of the Y chromosome as the only alteration; this was misclassified since the RNAseqCNV tool does not evaluate Y chromosome copy number changes so the sample was therefore classified as having no alterations by the RNAseqCNV tool (CHI_0802, DUX4).
+
+In many of these cases, RNAseqCNV correctly called the alterations but with low confidence, so the final chromosome number was given as 46. Of the incorrect samples, only 4 had aneuploidy as their primary clinically relevant alteration (Masked Hypodiploid = 2, Hyperdiploid = 1, Hypodiploid = 1), and one of these had an ambiguous cytogenetic report that classified the patient as having 46 chromosomes but reported Hypodiploid losses (ADII_0044: 46,XY by G-banding. Hypodiploid loss of 3,13,15,16,17,19,20 by SNParray).
+
+
+#### Incorrect RNAseqCNV Classification
+
+```{r cyto full table, echo=FALSE}
+ knitr::kable(cytoData %>% filter(correctBench == "Incorrect"))
+```
+
+
+### Comparison of Reported Chromosome Number
+
+Next, the ability of RNAseqCNV to accurately determine the exact number of chromosomes was investigated. RNAseqCNV accurately reported 46 chromosomes in 92% of "Normal" samples; however, the exact number of chromsomes in the hyperdiploid and hypodiploid groups were only 15% and 24% accurate, respectively. Overall, the accuracy at determining exact numbers was 48%.  
+
+```{r correct chrom_n, warning=FALSE, message=FALSE}
+
+# Create column comparing RNAseqCNV chrom_n with cytogenetic data karyo_n
+cytoData <- cytoData %>% 
+  mutate(correctN = if_else(chrom_n == karyo_n, "Correct", "Incorrect"))
+ 
+# Create dataframe for plotting percentages
+nAltPerc <- cytoData %>% 
+   count(oldCol, correctN) %>% 
+   group_by(oldCol) %>% 
+   mutate(label_y = n/sum(n)) 
+ 
+# Plot percentages 
+ nAltPlot <- nAltPerc %>% 
+   ggplot(aes(x=oldCol, y=label_y, fill=correctN)) +
+   geom_col(position="stack") +
+   geom_text(aes(label=paste(paste0(round(label_y*100, digits=0), "%"), paste0("(", n, ")"))), 
+             position=position_stack(vjust = 0.5),
+             colour="white",
+             size=3,
+             fontface="bold") +
+   scale_fill_manual(values= cbPalette) +
+   theme_classic() +
+   labs(x = "Ploidy",
+        y = "Percentage of Samples",
+        fill = "RNAseqCNV Result") +
+   ggtitle("Ability of RNAseqCNV to correctly determine exact chromosome number")
+
+```
+  
+```{r nAltPlot, echo=FALSE}
+ nAltPlot
+```
+
+
+#### Incorrectly Reported Chromosome Number
+
+Overall, RNAseqCNV appears to underestimate the number of chromosomal alterations. This is due to the confidence metrics calculated by the tool; low confidence calls are reported but will not be included in the final chromosome number generate. Due to this, reports of alterations with a final chromosome number between 45-47 should be interpreted with caution. 
+
+In addition, RNAseqCNV calls of low hypodiploid samples should be investigated for a diagnosis of masked hypodiploid. 
+
+
+
+```{r chrom number, warning=FALSE, message=FALSE}
+
+# Ensure columns of interest are numeric
+cytoData$karyo_n <- as.numeric(cytoData$karyo_n)
+cytoData$chrom_n <- as.numeric(cytoData$chrom_n)
+
+# Plot only incorrect N
+filteredCyto <- cytoData %>% filter(correctN == "Incorrect")
+
+# Reorder for plotting
+filteredCyto <- filteredCyto[order(filteredCyto$oldCol),]
+
+filteredCyto$patientID.x <- factor(filteredCyto$patientID.x,
+                          levels = filteredCyto$patientID.x[order(filteredCyto$oldCol)])
+
+# Labels for plotting
+y_labs <- filteredCyto$oldCol
+y_labs2 <- filteredCyto$primary.subtype
+
+
+karyBars <- filteredCyto  %>%
+  ggplot() +
+  geom_col(aes(x=patientID.x, y=chrom_n, fill = correctBench), width= 0.7) +
+  geom_col(aes(x=patientID.x, y= karyo_n, fill = "Number on Cytogenetics Report"), colour = "black", width = 0.7, alpha = 0.1) +
+  labs(x = "Actual Classification",
+       y = "Number of Chromosomes") +
+  ggtitle("Samples with Incorrect Chromosome Number Reported by RNAseqCNV") +
+  theme_classic() +
+ # theme(axis.text.y = element_blank(), axis.line.y = element_blank()) +
+  coord_flip(ylim = c(20,65)) +
+  geom_hline(aes(yintercept = 46, linetype= paste("Normal (n = 46)"))) +
+  scale_fill_manual(name = "RNAseqCNV Benchmarking", values = c(cbPalette[1:2], "white")) +
+  scale_linetype_manual("Line", values = 1) +
+  scale_x_discrete(labels = paste0(y_labs2, " [", y_labs, "]")) 
+
+```
+
+```{r chrom number plot, echo=FALSE}
+karyBars
+```
+
+#### Identifying Clinical Hyperdiploid or Hypodiploid ALL
+
+Despite the inaccuracy of chromosome number calls, RNAseqCNV correctly classified 88% of our samples where aneuploidy was the key alteration.  
+
+
+```{r aneuploid, warning=FALSE, message=FALSE}
+
+# Filter data for only clinically Hyper/Hypodiploid samples
+aneuploid <- noCyto %>% 
+  filter(col %in% c("Hypodiploid","Hyperdiploid"))
+
+# Create dataframe for plotting
+ aneuPerc <-  aneuploid %>% 
+   count(primary.subtype, correctBench) %>% 
+   group_by(primary.subtype) %>% 
+   mutate(label_y = n/sum(n))
+ 
+ aneuPlot <- aneuPerc %>%
+   ggplot(aes(x=primary.subtype, y=label_y, fill = correctBench)) +
+   geom_col(position="stack") +
+   geom_text(aes(label=paste(paste0(round(label_y*100, digits=0), "%"), paste0("(", n, ")"))), 
+             position=position_stack(vjust = 0.5),
+             colour="white",
+             size=3,
+             fontface="bold") +
+   scale_fill_manual(values= cbPalette[1:2]) +
+   theme_classic() +
+   theme(axis.text.x = element_text(angle = 45, vjust=1, hjust = 1)) +
+   labs(x = "Ploidy",
+        y = "Percentage of Samples",
+        fill = "RNAseqCNV Result") +
+   ggtitle("Ability of RNAseqCNV to diagnose Hyperdiploid and Hypodiploid ALL Subtypes")
+```
+  
+  
+```{r aneuPlot, echo = FALSE}
+aneuPlot
+```
+  
+
+```{r aneuploid table, echo =FALSE}
+knitr::kable(aneuploid %>% count(correctBench) %>% mutate(Percentage = n/sum(n)*100))
+```
+  
+  
+  
+
+Of the 7 incorrect samples, two were Masked Hypodiploid, which are difficult to detect; the tool classified all masked hypodiploids as Hypodiploid, whereas in our reports the final classification differs between Hyperdiploid and Hypodiploid. 
+
+One of the incorrect samples was mentioned earlier as having ambigous cytogenetics associated with it. The patient was classified as having 46 chromosomes but the report also stated Hypodiploid losses; RNAseqCNV correctly classified this patient as Hypodiploid.
+
+If we look at the final classification reported by our research team, the results match in 93% of cases. Of the remaining 4 incorrect cases, only one had a cytogenetics report. This sample was reported to be hyperdiploid whilst RNAseqCNV classified this as Hypodiploid; our notes suggest that this is another masked hyposiploid cases based on "clustering and TP53 mutations with VAF 0.98". The remaining three all had alterations reported by RNAseqCNV, but these alterations were considered low confidence and so were not included in the final number reported.
+
+```{r clin ploidy plot, warning=FALSE, message=FALSE}
+# Create column comparing RNAseqCNV chrom_n with cytogenetic data karyo_n
+aneuploidClin <- aneuploid %>% 
+  mutate(correctClin = if_else(cnvCol == col, "Correct", "Incorrect"))
+
+
+aneuPercClin <-  aneuploidClin %>% 
+  count(primary.subtype, correctClin) %>% 
+  group_by(primary.subtype) %>% 
+  mutate(label_y = n/sum(n))
+
+aneuPlotClin <- aneuPercClin %>%
+  ggplot(aes(x=primary.subtype, y=label_y, fill = correctClin)) +
+  geom_col(position="stack") +
+  geom_text(aes(label=paste(paste0(round(label_y*100, digits=0), "%"), paste0("(", n, ")"))), 
+            position=position_stack(vjust = 0.5),
+            colour="white",
+            size=3,
+            fontface="bold") +
+  scale_fill_manual(values= cbPalette[1:2]) +
+  theme_classic() +
+  theme(axis.text.x = element_text(angle = 45, vjust=1, hjust = 1)) +
+  labs(x = "Ploidy",
+       y = "Percentage of Samples",
+       fill = "RNAseqCNV Result") +
+  ggtitle("Ability of RNAseqCNV to diagnose Hyperdiploid and Hypodiploid ALL")
+
+```
+  
+```{r clin plot, echo = FALSE}
+aneuPlotClin
+```
+
+
+## Conclusion
+
+RNAseqCNV is able to correctly identify CNVs in patients where aneuploidy is their primary alteration. This tool can be used for research purposes to reclassify "B-Other" patients with missing cytogenetics, and can be adapted to be used in our pipeline on new samples.
